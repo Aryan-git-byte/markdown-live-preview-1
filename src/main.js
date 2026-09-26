@@ -1,7 +1,8 @@
 import Storehouse from 'storehouse-js';
-import * as monaco from 'https://cdn.jsdelivr.net/npm/monaco-editor@0.52.2/+esm';
+import * as monaco from 'monaco-editor';
 import { marked } from 'marked';
 import DOMPurify from 'dompurify';
+import mermaid from 'mermaid';
 
 const init = () => {
     let hasEdited = false;
@@ -12,7 +13,10 @@ const init = () => {
     const localStorageThemeKey = 'theme_settings';
     const INDEX_KEY = 'docs_index';
     const confirmationMessage = 'Are you sure you want to reset? Your changes will be lost.';
-    
+
+    let mermaidRenderTimer = null;
+    let mermaidRenderVersion = 0;
+
     // default template
     const defaultInput = `# Markdown syntax guide
 
@@ -78,6 +82,14 @@ let message = 'Hello world';
 alert(message);
 ${"`"}${"`"}${"`"}
 
+## Mermaid diagrams
+${"`"}${"`"}${"`"}mermaid
+graph TD
+  A[Start] --> B{Decision}
+  B -->|Yes| C[Finish]
+  B -->|No| D[Alternate]
+${"`"}${"`"}${"`"}
+
 ## Inline code
 
 This web site is using ${"`"}markedjs/marked${"`"}.
@@ -110,20 +122,20 @@ This web site is using ${"`"}markedjs/marked${"`"}.
 
     let saveCurrentDoc = (content) => {
         if (!currentDocId) return;
-        
+
         Storehouse.setItem(localStorageNamespace, `doc_${currentDocId}`, content, new Date(2099, 1, 1));
-        
+
         let index = getIndex();
         let docMeta = index.find(d => d.id === currentDocId);
-        
+
         if (!docMeta) {
             docMeta = { id: currentDocId, createdAt: Date.now() };
             index.push(docMeta);
         }
-        
+
         docMeta.title = getTitle(content);
         docMeta.updatedAt = Date.now();
-        
+
         index.sort((a, b) => b.updatedAt - a.updatedAt);
         saveIndex(index);
         renderSidebar();
@@ -143,17 +155,17 @@ This web site is using ${"`"}markedjs/marked${"`"}.
         window.location.hash = id;
         presetValue(defaultInput);
         // Force an initial save so it shows up in the sidebar immediately
-        saveCurrentDoc(defaultInput); 
+        saveCurrentDoc(defaultInput);
     };
 
     let deleteDoc = (id, event) => {
         event.stopPropagation();
         if(!confirm("Delete this document?")) return;
-        
+
         Storehouse.deleteItem(localStorageNamespace, `doc_${id}`);
         let index = getIndex().filter(d => d.id !== id);
         saveIndex(index);
-        
+
         if (currentDocId === id) {
             if (index.length > 0) loadDoc(index[0].id);
             else createNewDoc();
@@ -166,18 +178,18 @@ This web site is using ${"`"}markedjs/marked${"`"}.
         let index = getIndex();
         let list = document.getElementById('doc-list');
         list.innerHTML = '';
-        
+
         index.forEach(doc => {
             let li = document.createElement('li');
             if (doc.id === currentDocId) li.className = 'active';
-            
+
             let title = document.createElement('div');
             title.className = 'doc-title';
             title.innerText = doc.title || 'Untitled';
-            
+
             let delBtn = document.createElement('span');
             delBtn.className = 'delete-btn';
-            delBtn.innerHTML = '&#10005;'; 
+            delBtn.innerHTML = '&#10005;';
             delBtn.onclick = (e) => deleteDoc(doc.id, e);
             title.appendChild(delBtn);
 
@@ -249,15 +261,117 @@ This web site is using ${"`"}markedjs/marked${"`"}.
         return editor;
     };
 
+    let escapeHtml = (value) => {
+        return value
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    };
+
+    let createMarkedRenderer = () => {
+        const renderer = new marked.Renderer();
+        const renderCode = renderer.code.bind(renderer);
+
+        renderer.code = (token) => {
+            const lang = (token.lang || '').match(/^\S*/)?.[0].toLowerCase();
+            if (lang !== 'mermaid') {
+                return renderCode(token);
+            }
+
+            return `<pre class="mermaid">${escapeHtml(token.text)}</pre>\n`;
+        };
+
+        return renderer;
+    };
+
+    let configureMermaid = (theme) => {
+        mermaid.initialize({
+            startOnLoad: false,
+            securityLevel: 'strict',
+            theme
+        });
+    };
+
+    let showMermaidError = (element, error) => {
+        const message = error && error.message ? error.message : 'Unable to render Mermaid chart.';
+        element.classList.add('mermaid-error');
+        element.textContent = `Mermaid render error: ${message}`;
+    };
+
+    let getMermaidTheme = () => {
+        return document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'default';
+    };
+
+    let renderMermaidDiagramsNow = async (theme = getMermaidTheme()) => {
+        const outputElement = document.querySelector('#output');
+        if (!outputElement) {
+            return;
+        }
+
+        const version = ++mermaidRenderVersion;
+        configureMermaid(theme);
+
+        const elements = Array.from(outputElement.querySelectorAll('.mermaid'));
+        for (const [index, element] of elements.entries()) {
+            if (version !== mermaidRenderVersion) {
+                return;
+            }
+
+            const source = element.dataset.mermaidSource || element.textContent;
+            element.dataset.mermaidSource = source;
+            element.classList.remove('mermaid-error');
+
+            try {
+                const renderId = `mermaid-${Date.now()}-${version}-${index}`;
+                const { svg, bindFunctions } = await mermaid.render(renderId, source);
+                if (version !== mermaidRenderVersion) {
+                    return;
+                }
+                element.innerHTML = svg;
+                if (typeof bindFunctions === 'function') {
+                    bindFunctions(element);
+                }
+            } catch (error) {
+                showMermaidError(element, error);
+            }
+        }
+    };
+
+    let scheduleMermaidRender = () => {
+        if (mermaidRenderTimer) {
+            clearTimeout(mermaidRenderTimer);
+        }
+
+        mermaidRenderTimer = setTimeout(() => {
+            mermaidRenderTimer = null;
+            renderMermaidDiagramsNow();
+        }, 150);
+    };
+
+    let renderMermaidDiagrams = (theme) => {
+        if (mermaidRenderTimer) {
+            clearTimeout(mermaidRenderTimer);
+            mermaidRenderTimer = null;
+        }
+
+        return renderMermaidDiagramsNow(theme);
+    };
+
+    let renderer = createMarkedRenderer();
+
     // Render markdown text as html
     let convert = (markdown) => {
         let options = {
             headerIds: false,
-            mangle: false
+            mangle: false,
+            renderer
         };
         let html = marked.parse(markdown, options);
         let sanitized = DOMPurify.sanitize(html);
         document.querySelector('#output').innerHTML = sanitized;
+        scheduleMermaidRender();
     };
 
     // Reset input text
@@ -296,24 +410,33 @@ This web site is using ${"`"}markedjs/marked${"`"}.
     };
 
     // ----- preview CSS loader (switch github-markdown css) -----
-    const PREVIEW_CSS_LIGHT = 'css/github-markdown-light.css?v=1.11.0';
-    const PREVIEW_CSS_DARK = 'css/github-markdown-dark_dimmed.css?v=1.11.0';
+    const PREVIEW_CSS_LIGHT = 'css/github-markdown-light.css?v=a1a198514565';
+    const PREVIEW_CSS_DARK = 'css/github-markdown-dark_dimmed.css?v=5d3f5d9d207c';
 
     let setPreviewCss = (useDark) => {
         const link = document.getElementById('gh-markdown-link');
+        const desired = useDark ? PREVIEW_CSS_DARK : PREVIEW_CSS_LIGHT;
         if (!link) {
             const newLink = document.createElement('link');
             newLink.id = 'gh-markdown-link';
             newLink.rel = 'stylesheet';
-            newLink.href = useDark ? PREVIEW_CSS_DARK : PREVIEW_CSS_LIGHT;
+            newLink.href = desired;
             document.head.appendChild(newLink);
-            return;
+            return new Promise((resolve) => {
+                newLink.addEventListener('load', resolve, { once: true });
+                newLink.addEventListener('error', resolve, { once: true });
+            });
         }
 
-        const desired = useDark ? PREVIEW_CSS_DARK : PREVIEW_CSS_LIGHT;
-        if (link.getAttribute('href') !== desired) {
-            link.setAttribute('href', desired);
+        if (link.getAttribute('href') === desired) {
+            return Promise.resolve();
         }
+
+        return new Promise((resolve) => {
+            link.addEventListener('load', resolve, { once: true });
+            link.addEventListener('error', resolve, { once: true });
+            link.setAttribute('href', desired);
+        });
     };
 
     // ----- theme toggle (dark/light) -----
@@ -340,6 +463,7 @@ This web site is using ${"`"}markedjs/marked${"`"}.
             if (monaco && monaco.editor && typeof monaco.editor.setTheme === 'function') {
                 monaco.editor.setTheme(checked ? 'vs-dark' : 'vs');
             }
+            renderMermaidDiagrams();
         });
     };
 
@@ -360,91 +484,89 @@ This web site is using ${"`"}markedjs/marked${"`"}.
     };
 
     // ----- export preview -----
-    let exportLightCssPromise = null;
 
-    let getLightMarkdownCss = () => {
-        if (exportLightCssPromise) {
-            return exportLightCssPromise;
-        }
+    let restoreMermaidThemeAfterPrint = (theme) => {
+        const printMedia = window.matchMedia('print');
+        let printSessionStarted = false;
 
-        exportLightCssPromise = fetch(PREVIEW_CSS_LIGHT)
-            .then((response) => {
-                if (!response.ok) {
-                    throw new Error(`Failed to load export CSS: ${response.status}`);
-                }
-                return response.text();
-            })
-            .catch((error) => {
-                console.error('Failed to load light markdown CSS', error);
-                return '';
-            });
+        const cleanup = () => {
+            printMedia.removeEventListener('change', handlePrintMediaChange);
+        };
 
-        return exportLightCssPromise;
+        const handlePrintMediaChange = (event) => {
+            if (event.matches) {
+                printSessionStarted = true;
+                return;
+            }
+
+            if (!printSessionStarted) {
+                return;
+            }
+
+            cleanup();
+            renderMermaidDiagrams(theme);
+        };
+
+        printMedia.addEventListener('change', handlePrintMediaChange);
+        return cleanup;
     };
 
     let exportPreviewToPdf = () => {
-        const previewElement = document.querySelector('#preview-wrapper');
-        if (!previewElement) return;
+        const currentTheme = getMermaidTheme();
+        const printTheme = 'default';
 
-        if (typeof window.html2pdf !== 'function') {
-            window.alert('PDF export is not available yet. Please try again in a moment.');
-            return;
-        }
+        const cleanupPrintThemeListener = currentTheme === 'dark'
+            ? restoreMermaidThemeAfterPrint(currentTheme)
+            : null;
 
-        getLightMarkdownCss().then((lightCss) => {
-            const options = {
-                margin: 10,
-                filename: 'markdown-preview.pdf',
-                image: { type: 'jpeg', quality: 0.98 },
-                html2canvas: {
-                    scale: 2,
-                    useCORS: true,
-                    onclone: (clonedDoc) => {
-                        clonedDoc.documentElement.setAttribute('data-theme', 'light');
-
-                        const markdownLink = clonedDoc.getElementById('gh-markdown-link');
-                        if (markdownLink) {
-                            markdownLink.setAttribute('href', PREVIEW_CSS_LIGHT);
-                        }
-
-                        if (lightCss) {
-                            const style = clonedDoc.createElement('style');
-                            style.id = 'export-light-css';
-                            style.textContent = `${lightCss}\n#preview-wrapper, #output, body { background: #fff !important; color: #24292f !important; }`;
-                            clonedDoc.head.appendChild(style);
-                        }
-
-                        const clonedPreview = clonedDoc.getElementById('preview-wrapper');
-                        if (clonedPreview) {
-                            clonedPreview.style.background = '#fff';
-                            clonedPreview.style.color = '#24292f';
-                            clonedPreview.style.width = '190mm';
-                            clonedPreview.style.maxWidth = '190mm';
-                        }
-
-                        const clonedOutput = clonedDoc.getElementById('output');
-                        if (clonedOutput) {
-                            clonedOutput.style.background = '#fff';
-                            clonedOutput.style.color = '#24292f';
-                            clonedOutput.style.width = '190mm';
-                            clonedOutput.style.maxWidth = '190mm';
-                        }
-                    }
-                },
-                jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
-            };
-
-            window.html2pdf()
-                .set(options)
-                .from(previewElement)
-                .save()
-                .catch((error) => {
-                    console.error('Failed to export PDF', error);
-                });
+        renderMermaidDiagrams(printTheme).then(() => {
+            window.print();
+        }).catch((error) => {
+            // eslint-disable-next-line no-console
+            console.error('Failed to prepare PDF export', error);
+            if (currentTheme === 'dark') {
+                cleanupPrintThemeListener();
+                renderMermaidDiagrams(currentTheme);
+            }
+            window.alert('Unable to prepare the print preview. Please try again.');
         });
     };
 
-    // ----- setup actions -----
+    // ----- setup -----
+
+    // setup navigation actions
+    let setupOpenButton = () => {
+        const button = document.querySelector('#open-button');
+        const input = document.querySelector('#open-file-input');
+        if (!button || !input) return;
+
+        button.addEventListener('click', () => {
+            input.click();
+        });
+
+        input.addEventListener('change', async () => {
+            const file = input.files[0];
+            // Allow the same file to be selected again, including after a failed read.
+            input.value = '';
+            if (!file) return;
+
+            button.disabled = true;
+            let content;
+            try {
+                content = await file.text();
+            } catch (error) {
+                window.alert('Unable to read this file. Please try again.');
+                return;
+            } finally {
+                button.disabled = false;
+            }
+
+            presetValue(content);
+            saveCurrentDoc(content);
+            document.querySelector('#preview').scrollTo({ top: 0 });
+        });
+    };
+
     let setupResetButton = () => {
         document.querySelector("#reset-button").addEventListener('click', (event) => {
             event.preventDefault();
@@ -574,11 +696,11 @@ This web site is using ${"`"}markedjs/marked${"`"}.
 
     // ----- Entry Point -----
     let editor = setupEditor();
-    
+
     // Boot sequence: check URL hash -> check history index -> fallback to new
     let initialId = window.location.hash.substring(1);
     let index = getIndex();
-    
+
     if (initialId) {
         currentDocId = initialId;
         let content = Storehouse.getItem(localStorageNamespace, `doc_${initialId}`);
@@ -588,10 +710,10 @@ This web site is using ${"`"}markedjs/marked${"`"}.
     } else {
         createNewDoc();
     }
-    
+
     setupSidebar();
     renderSidebar();
-
+    setupOpenButton();
     setupResetButton();
     setupCopyButton(editor);
     setupExportButton();
